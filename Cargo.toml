@@ -2,7 +2,7 @@
 name = "ext-proc-http-bridge"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.99"
+rust-version = "1.89"
 description = "Envoy ext_proc gRPC service that exposes requests and responses as http::Request / http::Response to a handler"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/konrads/ext-proc-http-bridge"
@@ -35,7 +35,12 @@ hyper = { version = "1.12.0", features = ["client", "http2", "server"] }
 hyper-util = { version = "0.1.21", features = ["tokio"] }
 reqwest = { version = "0.13", features = ["json", "stream"] }
 serde = { version = "1.0.229", features = ["derive"] }
-tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "test-util"] }
+tokio = { version = "1", features = [
+    "macros",
+    "net",
+    "rt-multi-thread",
+    "test-util",
+] }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 [lints.clippy]
