@@ -1,0 +1,54 @@
+[package]
+name = "ext-proc-http-bridge"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+description = "Envoy ext_proc gRPC service that exposes requests and responses as http::Request / http::Response to a handler"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/konrads/ext-proc-http-bridge"
+keywords = ["envoy", "ext-proc", "grpc", "proxy", "http"]
+categories = ["network-programming", "web-programming::http-server"]
+exclude = [".github/"]
+
+[dependencies]
+anyhow = "1.0.104"
+async-stream = "0.3.6"
+async-trait = "0.1.92"
+bytes = "1.12.1"
+envoy-types = "0.7.7"
+futures = "0.3.34"
+http = "1.5.0"
+http-body = "1.1.0"
+serde_json = "1.0.154"
+strum = { version = "0.28.0", features = ["derive"] }
+thiserror = "2.0.21"
+tokio = { version = "1.54.1", features = ["sync", "time"] }
+tonic = "0.14.9"
+tracing = "0.1.44"
+
+[dev-dependencies]
+tonic-prost = "0.14.9"
+proptest = "1.12.0"
+http-body-util = "0.1.5"
+actix-web = "4.18.1"
+hyper = { version = "1.12.0", features = ["client", "http2", "server"] }
+hyper-util = { version = "0.1.21", features = ["tokio"] }
+reqwest = { version = "0.13", features = ["json", "stream"] }
+serde = { version = "1.0.229", features = ["derive"] }
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "test-util"] }
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "warn"
+missing_const_for_fn = "allow"
+too_many_lines = "allow"
+significant_drop_tightening = "allow"
+
+[lints.rust]
+rust_2018_idioms = "deny"
+deprecated = "deny"
+unsafe_code = "deny"

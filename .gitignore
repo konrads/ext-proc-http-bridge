@@ -1,0 +1,9 @@
+/target
+.DS_Store
+* copy *
+* copy.*
+* copy ?.*
+* copy/*
+* copy ?/*
+*.bk
+*balls*

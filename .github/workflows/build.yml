@@ -1,0 +1,36 @@
+name: build
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Install Rust
+        run: rustup toolchain install
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+      - name: Install Envoy
+        run: |
+          id=$(docker create envoyproxy/envoy:v1.40.2)
+          sudo docker cp "$id:/usr/local/bin/envoy" /usr/local/bin/envoy
+          docker rm "$id"
+      - name: Format
+        run: |
+          rustup toolchain install nightly --profile minimal --component rustfmt
+          cargo +nightly fmt --check
+      - name: Build
+        run: cargo build --verbose
+      - name: Clippy
+        run: cargo clippy --all-targets --verbose -- -D warnings
+      - name: Test
+        run: cargo test --verbose
