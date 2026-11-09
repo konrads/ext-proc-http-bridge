@@ -179,12 +179,7 @@ async fn send_waits_for_room_in_a_full_channel() {
     assert!(futures::poll!(&mut task).is_pending());
     assert!(matches!(rx.recv().await, Some(BodyMessage::Frame(Ok(_)))));
     let completion = task.await;
-    assert!(matches!(
-        completion.event,
-        Event::ChunkSent {
-            end_of_stream: true
-        }
-    ));
+    assert!(matches!(completion.event, Event::ChunkSent { last: true }));
     assert!(matches!(rx.recv().await, Some(BodyMessage::End)));
 }
 
@@ -200,12 +195,7 @@ async fn send_to_a_dropped_body_completes() {
             assert!(futures::poll!(&mut task).is_pending());
         }
         drop(rx);
-        assert!(matches!(
-            task.await.event,
-            Event::ChunkSent {
-                end_of_stream: true
-            }
-        ));
+        assert!(matches!(task.await.event, Event::ChunkSent { last: true }));
     }
 }
 

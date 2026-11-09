@@ -55,19 +55,8 @@ pub(super) fn transition(
     } = config;
     // Each arm is one transition and evaluates to the next state.
     let next = match (state, event) {
-        // Headers
-        (State::InitRequest, Event::Headers(Direction::Request, msg)) => {
-            out.commands.push(Command::CallHandler {
-                msg,
-                context: http::Extensions::new(),
-            });
-            if let Some(timeout) = override_message_timeout {
-                out.reply = Some(Reply::MessageTimeout(timeout));
-            }
-            State::Headers(Direction::Request)
-        }
         // Request headers come first unless `processing_mode` skips them.
-        (State::InitRequest, Event::Headers(Direction::Response, msg)) => {
+        (State::InitRequest, Event::Headers(direction, msg)) => {
             out.commands.push(Command::CallHandler {
                 msg,
                 context: http::Extensions::new(),
@@ -75,7 +64,7 @@ pub(super) fn transition(
             if let Some(timeout) = override_message_timeout {
                 out.reply = Some(Reply::MessageTimeout(timeout));
             }
-            State::Headers(Direction::Response)
+            State::Headers(direction)
         }
         (State::InitResponse(context), Event::Headers(Direction::Response, msg)) => {
             out.commands.push(Command::CallHandler { msg, context });
@@ -188,12 +177,7 @@ pub(super) fn transition(
                 pending: body.pending,
             }
         }
-        (
-            State::Body(body),
-            Event::ChunkSent {
-                end_of_stream: false,
-            },
-        ) => {
+        (State::Body(body), Event::ChunkSent { last: false }) => {
             out.reply = Some(Reply::ContinueBody(body.direction));
             out.commands.push(Command::Read);
             State::Body(body)
@@ -205,9 +189,7 @@ pub(super) fn transition(
                 end,
                 pending,
             },
-            Event::ChunkSent {
-                end_of_stream: true,
-            },
+            Event::ChunkSent { last: true },
         ) => match pending {
             Some(changes) => finish_body(direction, end, changes, &mut out)?,
             None => {

@@ -62,7 +62,7 @@ pub(super) enum Event {
     /// `None`: the body was dropped without being requested.
     FetchBody(Option<BodyRequest>),
     ChunkSent {
-        end_of_stream: bool,
+        last: bool,
     },
 }
 

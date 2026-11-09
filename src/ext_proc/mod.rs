@@ -10,10 +10,7 @@ use envoy_types::pb::envoy::service::ext_proc::v3::{
 use futures::{Future, Stream, StreamExt, future, stream::FuturesUnordered};
 use http_body::Frame;
 use tokio::{
-    sync::{
-        mpsc::{self, error::TrySendError},
-        oneshot,
-    },
+    sync::{mpsc, oneshot},
     time,
 };
 use tonic::{Request, Response, Status, Streaming};
@@ -114,15 +111,14 @@ impl ExternalProcessor for ExtProc {
                     }
                 }
                 if transition.next.is_none() {
+                    // The break runs only on the next poll, so drop pending tasks before yielding.
                     tasks.clear();
                 }
                 if let Some(reply) = transition.reply {
                     yield Ok(ProcessingResponse::from(reply));
                 }
-                match transition.next {
-                    Some(next) => state = next,
-                    None => break,
-                }
+                let Some(next) = transition.next else { break };
+                state = next;
             }
         };
 
@@ -131,6 +127,7 @@ impl ExternalProcessor for ExtProc {
 }
 
 /// Starts the handler and the wait for its body request; the result is delivered only after that request resolves.
+/// Returns them as separate tasks, as the body request must reach the FSM while the handler is still running.
 fn call_handler(
     handler: &Arc<dyn Handler>,
     config: BodyConfig,
@@ -245,36 +242,26 @@ fn next_envoy_msg(envoy: &mut Option<EnvoyStream>) -> Task {
 }
 
 /// Sends a chunk and marks successful completion after the last chunk.
-fn send_chunk(tx: mpsc::Sender<BodyMessage>, data: Bytes, end_of_stream: bool) -> Task {
+fn send_chunk(tx: mpsc::Sender<BodyMessage>, data: Bytes, last: bool) -> Task {
     let frame = (!data.is_empty()).then(|| BodyMessage::Frame(Ok(Frame::data(data))));
-    let end = end_of_stream.then_some(BodyMessage::End);
-    send_messages(tx, [frame, end], Event::ChunkSent { end_of_stream })
+    let end = last.then_some(BodyMessage::End);
+    send_messages(tx, [frame, end], Event::ChunkSent { last })
 }
 
-/// Sends in place while the channel has room; waits once it is full.
+/// Stops early if the receiver is gone.
 fn send_messages(
     tx: mpsc::Sender<BodyMessage>,
     messages: [Option<BodyMessage>; 2],
     event: Event,
 ) -> Task {
-    let mut messages = messages.into_iter().flatten();
-    while let Some(message) = messages.next() {
-        match tx.try_send(message) {
-            Ok(()) => {}
-            Err(TrySendError::Closed(_)) => break,
-            Err(TrySendError::Full(message)) => {
-                return Box::pin(async move {
-                    for message in std::iter::once(message).chain(messages) {
-                        if tx.send(message).await.is_err() {
-                            break;
-                        }
-                    }
-                    event.into()
-                });
+    Box::pin(async move {
+        for message in messages.into_iter().flatten() {
+            if tx.send(message).await.is_err() {
+                break;
             }
         }
-    }
-    task_ready(event)
+        event.into()
+    })
 }
 
 // helpers

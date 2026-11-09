@@ -9,9 +9,7 @@ fn body_completion_and_handler_result_can_arrive_in_either_order() {
     for handler_first in [false, true] {
         for end in [BodyEnd::LastChunk, BodyEnd::Trailers] {
             let mut state = sending_body_end(end);
-            let sent = Event::ChunkSent {
-                end_of_stream: true,
-            };
+            let sent = Event::ChunkSent { last: true };
             let events = if handler_first {
                 [handled(), sent]
             } else {
@@ -61,9 +59,7 @@ fn no_envoy_read_is_pending_while_finishing_the_body() {
             output.commands.as_slice(),
             [Command::SendChunk { last: true, .. }]
         ));
-        let sent = Event::ChunkSent {
-            end_of_stream: true,
-        };
+        let sent = Event::ChunkSent { last: true };
         let output = transition(ExtProcConfig::default(), output.next.unwrap(), sent).unwrap();
         assert!(matches!(output.next, Some(State::WaitingForHandler { .. })));
         assert!(output.commands.is_empty());
@@ -194,9 +190,7 @@ fn trailers_reply_carries_the_handler_metadata() {
     let output = transition(
         ExtProcConfig::default(),
         state,
-        Event::ChunkSent {
-            end_of_stream: true,
-        },
+        Event::ChunkSent { last: true },
     )
     .unwrap();
     assert!(
@@ -528,10 +522,9 @@ mod proptests {
                 Event::EnvoyEnd(Some(status)) => Self::EnvoyFailed(status.clone()),
                 Event::EnvoyEnd(None) => Self::EnvoyClosed,
                 Event::Handled(Action::ImmediateResponse(_)) => Self::Immediate,
-                Event::Handled(Action::Continue(_))
-                | Event::ChunkSent {
-                    end_of_stream: true,
-                } => body_direction.map_or(Self::Other, Self::Changes),
+                Event::Handled(Action::Continue(_)) | Event::ChunkSent { last: true } => {
+                    body_direction.map_or(Self::Other, Self::Changes)
+                }
                 _ => Self::Other,
             }
         }
@@ -912,9 +905,7 @@ mod proptests {
                     if last {
                         let _ = tx.try_send(BodyMessage::End);
                     }
-                    Event::ChunkSent {
-                        end_of_stream: last,
-                    }
+                    Event::ChunkSent { last }
                 }
                 Pending::Event(event) => *event,
             })

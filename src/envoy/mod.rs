@@ -14,9 +14,9 @@ use envoy_types::pb::{
         },
         service::ext_proc::v3::{
             BodyMutation, BodyResponse, CommonResponse, HeaderMutation as EnvoyHeaderMutation,
-            HeadersResponse, HttpBody, HttpHeaders, ImmediateResponse, ProcessingRequest,
-            ProcessingResponse, TrailersResponse, body_mutation, common_response::ResponseStatus,
-            processing_request, processing_response,
+            HeadersResponse, HttpBody, HttpHeaders, ImmediateResponse as EnvoyImmediateResponse,
+            ProcessingRequest, ProcessingResponse, TrailersResponse, body_mutation,
+            common_response::ResponseStatus, processing_request, processing_response,
         },
         r#type::v3::HttpStatus,
     },
@@ -27,7 +27,7 @@ use tonic::Status;
 
 use crate::{
     body::BodyMode,
-    handler::{self, EnvoyAttributes, EnvoyMetadata, HeaderMutation},
+    handler::{EnvoyAttributes, EnvoyMetadata, HeaderMutation, ImmediateResponse},
 };
 
 pub mod json;
@@ -125,7 +125,7 @@ pub(crate) enum Reply {
         direction: Direction,
         dynamic_metadata: serde_json::Map<String, serde_json::Value>,
     },
-    ImmediateResponse(handler::ImmediateResponse),
+    ImmediateResponse(ImmediateResponse),
     /// Asks Envoy to extend the timer for the current message.
     MessageTimeout(Duration),
 }
@@ -430,10 +430,10 @@ fn trailers(
     }
 }
 
-fn immediate_response(resp: handler::ImmediateResponse) -> ProcessingResponse {
+fn immediate_response(resp: ImmediateResponse) -> ProcessingResponse {
     ProcessingResponse {
         response: Some(processing_response::Response::ImmediateResponse(
-            ImmediateResponse {
+            EnvoyImmediateResponse {
                 status: Some(HttpStatus {
                     code: i32::from(resp.status.as_u16()),
                 }),
