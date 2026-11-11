@@ -138,7 +138,7 @@ fn unrequested_trailers_pass_through_unchanged() {
         (State::InitResponse(Default::default()), Direction::Request),
         (State::ResponseDone, Direction::Response),
     ] {
-        let name = <&'static str>::from(&state);
+        let name = state.name();
         let output =
             transition(ExtProcConfig::default(), state, Event::Trailers(direction)).unwrap();
         assert!(
@@ -149,7 +149,7 @@ fn unrequested_trailers_pass_through_unchanged() {
             matches!(output.commands.as_slice(), [Command::Read]),
             "{name}"
         );
-        assert_eq!(output.next.as_ref().map(<&'static str>::from), Some(name));
+        assert_eq!(output.next.as_ref().map(State::name), Some(name));
     }
 }
 

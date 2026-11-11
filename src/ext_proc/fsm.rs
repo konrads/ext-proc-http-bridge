@@ -303,8 +303,8 @@ pub(super) fn transition(
         }
         (state, event) => {
             warn!(
-                state = <&'static str>::from(&state),
-                event = <&'static str>::from(&event),
+                state = state.name(),
+                event = event.name(),
                 "Unexpected state/event combination"
             );
             return Err(Status::internal("Unexpected state/event combination"));

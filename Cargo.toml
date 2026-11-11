@@ -1,6 +1,6 @@
 [package]
 name = "ext-proc-http-bridge"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 rust-version = "1.89"
 description = "Envoy ext_proc gRPC service that exposes requests and responses as http::Request / http::Response to a handler"
@@ -20,13 +20,17 @@ futures = "0.3.34"
 http = "1.5.0"
 http-body = "1.1.0"
 serde_json = "1.0.154"
-strum = { version = "0.28.0", features = ["derive"] }
 thiserror = "2.0.21"
 tokio = { version = "1.54.1", features = ["sync", "time"] }
 tonic = "0.14.9"
 tracing = "0.1.44"
 
 [dev-dependencies]
+opentelemetry-http = "0.32"
+opentelemetry = "0.32"
+opentelemetry_sdk = { version = "0.32", features = ["testing"] }
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["grpc-tonic", "trace"] }
+tracing-opentelemetry = "0.33"
 tonic-prost = "0.14.9"
 proptest = "1.12.0"
 http-body-util = "0.1.5"
@@ -40,6 +44,7 @@ tokio = { version = "1", features = [
     "net",
     "rt-multi-thread",
     "test-util",
+    "signal",
 ] }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 

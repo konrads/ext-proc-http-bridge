@@ -14,7 +14,7 @@ pub(super) type Action = HandlerAction<ContinueAction>;
 
 // One per stream; keep variants inline to avoid extra heap allocations.
 #[allow(clippy::large_enum_variant)]
-#[derive(Debug, strum::IntoStaticStr)]
+#[derive(Debug)]
 pub(super) enum State {
     InitRequest,
     Headers(Direction),
@@ -44,9 +44,23 @@ impl State {
             Direction::Response => Self::ResponseDone,
         }
     }
+
+    /// Variant name, for logs.
+    pub(super) const fn name(&self) -> &'static str {
+        match self {
+            Self::InitRequest => "InitRequest",
+            Self::Headers(_) => "Headers",
+            Self::Body(_) => "Body",
+            Self::SendingBodyEnd { .. } => "SendingBodyEnd",
+            Self::WaitingForHandler { .. } => "WaitingForHandler",
+            Self::EarlyResponse(_) => "EarlyResponse",
+            Self::InitResponse(_) => "InitResponse",
+            Self::ResponseDone => "ResponseDone",
+        }
+    }
 }
 
-#[derive(Debug, strum::IntoStaticStr)]
+#[derive(Debug)]
 pub(super) enum Event {
     Headers(Direction, Headers),
     Body(Direction, BodyChunk),
@@ -64,6 +78,22 @@ pub(super) enum Event {
     ChunkSent {
         last: bool,
     },
+}
+
+impl Event {
+    /// Variant name, for logs.
+    pub(super) const fn name(&self) -> &'static str {
+        match self {
+            Self::Headers(..) => "Headers",
+            Self::Body(..) => "Body",
+            Self::Trailers(_) => "Trailers",
+            Self::EnvoyEnd(_) => "EnvoyEnd",
+            Self::Handled(_) => "Handled",
+            Self::HandlerFailed { .. } => "HandlerFailed",
+            Self::FetchBody(_) => "FetchBody",
+            Self::ChunkSent { .. } => "ChunkSent",
+        }
+    }
 }
 
 impl From<Message> for Event {

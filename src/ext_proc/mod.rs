@@ -14,10 +14,12 @@ use tokio::{
     time,
 };
 use tonic::{Request, Response, Status, Streaming};
+use tracing::{Instrument, Span};
 
 use self::{
     fsm::Command,
     state::{Action, ContinueAction, Event, State},
+    trace::SpanInitializer,
 };
 use crate::{
     body::{BodyConfig, BodyMessage, BodyRequest, LazyBody},
@@ -29,6 +31,7 @@ pub use crate::envoy::{HeaderMode, ProcessingMode};
 
 mod fsm;
 mod state;
+mod trace;
 
 type ProcessStream = Pin<Box<dyn Stream<Item = Result<ProcessingResponse, Status>> + Send>>;
 
@@ -51,12 +54,28 @@ pub struct ExtProcConfig {
 pub struct ExtProc {
     handler: Arc<dyn Handler>,
     config: ExtProcConfig,
+    span_initializer: Option<SpanInitializer>,
 }
 
 impl ExtProc {
     #[must_use]
     pub fn new(handler: Arc<dyn Handler>, config: ExtProcConfig) -> Self {
-        Self { handler, config }
+        Self {
+            handler,
+            config,
+            span_initializer: None,
+        }
+    }
+
+    /// Initializes each `ext_proc` span from gRPC metadata before it is entered or creates children.
+    /// Without an initializer, the span inherits the current tracing span.
+    #[must_use]
+    pub fn with_span_initializer(
+        mut self,
+        span_initializer: impl Fn(&Span, &http::HeaderMap) + Send + Sync + 'static,
+    ) -> Self {
+        self.span_initializer = Some(Arc::new(span_initializer));
+        self
     }
 }
 
@@ -68,8 +87,14 @@ impl ExternalProcessor for ExtProc {
         &self,
         request: Request<Streaming<ProcessingRequest>>,
     ) -> Result<Response<Self::ProcessStream>, Status> {
-        let mut envoy: Option<EnvoyStream> = Some(request.into_inner());
+        let (metadata, _, envoy) = request.into_parts();
+        let span = trace::stream_span();
+        if let Some(initialize) = &self.span_initializer {
+            initialize(&span, &metadata.into_headers());
+        }
+        let mut envoy = Some(envoy);
         let this = self.clone();
+        let stream_span = span.clone();
 
         let response_stream = stream! {
             let mut tasks = FuturesUnordered::new();
@@ -82,12 +107,13 @@ impl ExternalProcessor for ExtProc {
                     envoy = Some(stream);
                 }
 
-                tracing::debug!(state = <&'static str>::from(&state), event = <&'static str>::from(&event), "Processing event");
+                tracing::debug!(state = state.name(), event = event.name(), "Processing event");
 
                 // Cancel pending work before yielding a terminal reply, which suspends the stream.
                 let transition = match fsm::transition(this.config, state, event) {
                     Ok(transition) => transition,
                     Err(status) => {
+                        trace::mark_error(&stream_span);
                         tasks.clear();
                         yield Err(status);
                         break;
@@ -96,15 +122,16 @@ impl ExternalProcessor for ExtProc {
                 for command in transition.commands {
                     match command {
                         Command::Read => tasks.push(next_envoy_msg(&mut envoy)),
-                        Command::CallHandler {
-                            msg,
-                            context,
-                        } => tasks.extend(call_handler(
-                            &this.handler,
-                            this.config.body,
-                            msg,
-                            context,
-                        )),
+                        Command::CallHandler { msg, context } => {
+                            trace::record_head(&stream_span, &msg.head);
+                            tasks.extend(call_handler(
+                                &this.handler,
+                                this.config.body,
+                                &stream_span,
+                                msg,
+                                context,
+                            ));
+                        }
                         Command::SendChunk { tx, data, last } => tasks.push(send_chunk(tx, data, last)),
                         Command::Requeue(event) => tasks.push(task_ready(event)),
                         Command::AbortBody(tx) => drop(tx),
@@ -115,6 +142,7 @@ impl ExternalProcessor for ExtProc {
                     tasks.clear();
                 }
                 if let Some(reply) = transition.reply {
+                    trace::record_reply(&stream_span, &reply);
                     yield Ok(ProcessingResponse::from(reply));
                 }
                 let Some(next) = transition.next else { break };
@@ -122,7 +150,10 @@ impl ExternalProcessor for ExtProc {
             }
         };
 
-        Ok(Response::new(Box::pin(response_stream)))
+        Ok(Response::new(Box::pin(trace::instrument_stream(
+            response_stream,
+            span,
+        ))))
     }
 }
 
@@ -131,6 +162,7 @@ impl ExternalProcessor for ExtProc {
 fn call_handler(
     handler: &Arc<dyn Handler>,
     config: BodyConfig,
+    stream_span: &Span,
     msg: Headers,
     mut context: http::Extensions,
 ) -> [Task; 2] {
@@ -147,6 +179,8 @@ fn call_handler(
         (LazyBody::new(config, control_tx), Some(control_rx))
     };
     let handler = Arc::clone(handler);
+    let handler_span = trace::handler_span(stream_span, &head);
+    let error_span = handler_span.clone();
     // Dropping the message when the handler returns resolves an unused body request to `None`.
     let handled = async move {
         let result = match head {
@@ -167,9 +201,13 @@ fn call_handler(
         };
         match result {
             Ok(action) => Event::Handled(action),
-            Err(error) => Event::HandlerFailed { error, context },
+            Err(error) => {
+                trace::mark_error(&error_span);
+                Event::HandlerFailed { error, context }
+            }
         }
-    };
+    }
+    .instrument(handler_span);
     let (fetched_tx, fetched_rx) = oneshot::channel::<()>();
     [
         Box::pin(async {

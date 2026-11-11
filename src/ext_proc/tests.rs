@@ -1,6 +1,8 @@
 //! In-memory tests of the real processing loop and its asynchronous tasks.
 
 use std::{
+    collections::BTreeMap,
+    fmt,
     num::NonZeroUsize,
     pin::pin,
     sync::{
@@ -23,7 +25,18 @@ use envoy_types::pb::envoy::{
     },
 };
 use http_body_util::StreamBody;
+use tonic::metadata::MetadataMap;
 use tonic_prost::{ProstDecoder, prost::Message};
+use tracing::{
+    Subscriber,
+    field::{Field, Visit},
+    span::{Attributes, Id, Record},
+};
+use tracing_subscriber::{
+    Layer, Registry,
+    layer::{Context, SubscriberExt},
+    registry::LookupSpan,
+};
 
 use super::*;
 use crate::{
@@ -50,6 +63,50 @@ struct TestHandler {
 type Input = mpsc::Sender<Result<ProcessingRequest, Status>>;
 
 struct DropSignal<'a>(&'a AtomicBool);
+
+struct FailingHandler;
+
+#[test]
+fn stream_span_is_current_only_during_poll() {
+    use std::task::{Context, Poll};
+
+    let _subscriber = test_subscriber(Registry::default());
+    let caller = tracing::info_span!("caller");
+    let _entered = caller.enter();
+    let request = trace::stream_span();
+    let expected = request.id();
+    assert!(expected.is_some());
+    let mut first = true;
+    let stream = futures::stream::poll_fn(move |_| {
+        assert_eq!(Span::current().id(), expected);
+        let was_first = first;
+        first = false;
+        if was_first {
+            Poll::Pending
+        } else {
+            Poll::Ready(Some(()))
+        }
+    });
+    let mut stream = pin!(trace::instrument_stream(stream, request));
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    assert_eq!(stream.as_mut().poll_next(&mut cx), Poll::Pending);
+    assert_eq!(Span::current().id(), caller.id());
+    assert_eq!(stream.as_mut().poll_next(&mut cx), Poll::Ready(Some(())));
+    assert_eq!(Span::current().id(), caller.id());
+}
+
+/// Collects each span with its parent and fields when it closes.
+#[derive(Clone, Default)]
+struct SpanLog(Arc<Mutex<Vec<SpanRecord>>>);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SpanRecord {
+    name: &'static str,
+    parent: Option<&'static str>,
+    fields: BTreeMap<String, String>,
+}
+
+struct FieldVisitor<'a>(&'a mut BTreeMap<String, String>);
 
 #[tokio::test(start_paused = true)]
 async fn collection_requests_body_before_waiting_for_its_bytes() {
@@ -421,6 +478,10 @@ impl Drop for DropSignal<'_> {
 }
 
 async fn start(handler: Arc<dyn Handler>, config: ExtProcConfig) -> (Input, ProcessStream) {
+    start_with(ExtProc::new(handler, config), MetadataMap::new()).await
+}
+
+async fn start_with(ext_proc: ExtProc, metadata: MetadataMap) -> (Input, ProcessStream) {
     let (tx, rx) = mpsc::channel::<Result<ProcessingRequest, Status>>(8);
     let frames = futures::stream::unfold(rx, |mut rx| async move {
         let message = rx.recv().await?;
@@ -436,11 +497,9 @@ async fn start(handler: Arc<dyn Handler>, config: ExtProcConfig) -> (Input, Proc
     });
     let input =
         Streaming::new_request(ProstDecoder::default(), StreamBody::new(frames), None, None);
-    let output = ExtProc::new(handler, config)
-        .process(Request::new(input))
-        .await
-        .unwrap()
-        .into_inner();
+    let mut request = Request::new(input);
+    *request.metadata_mut() = metadata;
+    let output = ext_proc.process(request).await.unwrap().into_inner();
     (tx, output)
 }
 
@@ -595,4 +654,335 @@ fn trailers_reply(direction: Direction) -> ProcessingResponse {
         }),
         ..Default::default()
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn spans_record_the_exchange() {
+    let (spans, _guard) = capture_spans();
+    let (input, mut output) = start(
+        Arc::new(TestHandler::new(Mode::Collect)),
+        ExtProcConfig::default(),
+    )
+    .await;
+    let mut request = headers(Direction::Request, true);
+    let Some(processing_request::Request::RequestHeaders(h)) = &mut request.request else {
+        unreachable!()
+    };
+    h.headers.as_mut().unwrap().headers.push(HeaderValue {
+        key: "x-request-id".into(),
+        raw_value: b"abc".to_vec(),
+        ..Default::default()
+    });
+    input.send(Ok(request)).await.unwrap();
+    reply(&mut output).await.unwrap();
+    input
+        .send(Ok(headers(Direction::Response, true)))
+        .await
+        .unwrap();
+    reply(&mut output).await.unwrap();
+    drop(input);
+    assert!(output.next().await.is_none());
+    drop(output);
+
+    let fields = |pairs: &[(&str, &str)]| -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect()
+    };
+    assert_eq!(
+        spans.sorted(),
+        [
+            SpanRecord {
+                name: "ext_proc",
+                parent: None,
+                fields: fields(&[
+                    ("http.request.method", "POST"),
+                    ("http.response.status_code", "200"),
+                    ("otel.kind", "server"),
+                    ("request_id", "abc"),
+                    ("url.path", "/"),
+                ]),
+            },
+            SpanRecord {
+                name: "handle_request",
+                parent: Some("ext_proc"),
+                fields: BTreeMap::new(),
+            },
+            SpanRecord {
+                name: "handle_response",
+                parent: Some("ext_proc"),
+                fields: BTreeMap::new(),
+            },
+        ]
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn handler_failure_marks_both_spans_as_errors() {
+    let (spans, _guard) = capture_spans();
+    let (input, mut output) = start(Arc::new(FailingHandler), ExtProcConfig::default()).await;
+    input
+        .send(Ok(headers(Direction::Request, true)))
+        .await
+        .unwrap();
+    assert!(reply(&mut output).await.is_err());
+    assert!(output.next().await.is_none());
+    drop((input, output));
+
+    let status = |name| {
+        spans
+            .sorted()
+            .into_iter()
+            .find(|span| span.name == name)
+            .and_then(|span| span.fields.get("otel.status_code").cloned())
+    };
+    assert_eq!(status("ext_proc").as_deref(), Some("ERROR"));
+    assert_eq!(
+        status("handle_request").as_deref(),
+        Some("ERROR"),
+        "{:?}",
+        spans.sorted()
+    );
+}
+
+#[tokio::test]
+async fn grpc_context_controls_exported_trace_and_sampling() {
+    use opentelemetry::{
+        propagation::TextMapPropagator,
+        trace::{SpanId, TraceContextExt, TraceId, TracerProvider},
+    };
+    use opentelemetry_sdk::{
+        propagation::TraceContextPropagator,
+        trace::{InMemorySpanExporter, Sampler, SdkTracerProvider},
+    };
+    use tracing_opentelemetry::OpenTelemetrySpanExt;
+
+    for (header, exported) in [
+        (
+            Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"),
+            true,
+        ),
+        (
+            Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-00"),
+            false,
+        ),
+        (Some("invalid"), true),
+        (None, true),
+    ] {
+        let exporter = InMemorySpanExporter::default();
+        let provider = SdkTracerProvider::builder()
+            .with_sampler(Sampler::ParentBased(Box::new(Sampler::AlwaysOn)))
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let subscriber = Registry::default()
+            .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("test")));
+        let _guard = test_subscriber(subscriber);
+        let observed = Arc::new(Mutex::new(None));
+        let captured = observed.clone();
+        let processor = ExtProc::new(
+            Arc::new(TestHandler::new(Mode::Collect)),
+            ExtProcConfig::default(),
+        )
+        .with_span_initializer(move |span, metadata| {
+            let parent = TraceContextPropagator::new()
+                .extract(&opentelemetry_http::HeaderExtractor(metadata));
+            span.set_parent(parent).unwrap();
+            *captured.lock().unwrap() = Some(span.context().span().span_context().clone());
+        });
+        let mut metadata = MetadataMap::new();
+        if let Some(header) = header {
+            metadata.insert("traceparent", header.parse().unwrap());
+            metadata.insert("tracestate", "vendor=value".parse().unwrap());
+        }
+        let (input, mut output) = start_with(processor, metadata).await;
+        for direction in [Direction::Request, Direction::Response] {
+            input.send(Ok(headers(direction, true))).await.unwrap();
+            reply(&mut output).await.unwrap();
+        }
+        drop(input);
+        assert!(output.next().await.is_none());
+        drop(output);
+        provider.force_flush().unwrap();
+        let spans = exporter.get_finished_spans().unwrap();
+        let context = observed.lock().unwrap().clone().unwrap();
+        assert_eq!(context.is_sampled(), exported);
+        if !exported {
+            assert!(spans.is_empty());
+            assert_eq!(
+                context.trace_id(),
+                TraceId::from_hex("4bf92f3577b34da6a3ce929d0e0e4736").unwrap()
+            );
+            continue;
+        }
+        assert_eq!(spans.len(), 3);
+        let root = spans.iter().find(|s| s.name == "ext_proc").unwrap();
+        if header.is_some_and(|h| h.starts_with("00-")) {
+            assert_eq!(
+                root.span_context.trace_id(),
+                TraceId::from_hex("4bf92f3577b34da6a3ce929d0e0e4736").unwrap()
+            );
+            assert_eq!(
+                root.parent_span_id,
+                SpanId::from_hex("00f067aa0ba902b7").unwrap()
+            );
+            assert_eq!(root.span_context.trace_state().get("vendor"), Some("value"));
+        } else {
+            assert_eq!(root.parent_span_id, SpanId::INVALID);
+            assert!(root.span_context.is_valid());
+        }
+        for child in spans.iter().filter(|s| s.name != "ext_proc") {
+            assert_eq!(child.span_context.trace_id(), root.span_context.trace_id());
+            assert_eq!(child.parent_span_id, root.span_context.span_id());
+        }
+    }
+}
+
+#[tokio::test]
+async fn request_immediate_response_records_status_without_response_headers() {
+    let (spans, _guard) = capture_spans();
+    let (input, mut output) = start(
+        Arc::new(TestHandler::new(Mode::Immediate)),
+        ExtProcConfig::default(),
+    )
+    .await;
+    input
+        .send(Ok(headers(Direction::Request, true)))
+        .await
+        .unwrap();
+    reply(&mut output).await.unwrap();
+    drop((input, output));
+    let spans = spans.sorted();
+    let span = spans.iter().find(|s| s.name == "ext_proc").unwrap();
+    assert_eq!(span.fields["http.response.status_code"], "403");
+    assert!(!spans.iter().any(|s| s.name == "handle_response"));
+}
+
+#[tokio::test]
+async fn spans_record_immediate_and_overridden_status() {
+    struct StatusHandler(bool);
+    #[async_trait::async_trait]
+    impl Handler for StatusHandler {
+        async fn handle_response(
+            &self,
+            response: &http::Response<LazyBody>,
+            _: &http::Extensions,
+        ) -> anyhow::Result<HandlerAction<ResponseContinue>> {
+            response.body().collect().await?;
+            if self.0 {
+                Ok(HandlerAction::ImmediateResponse(
+                    crate::handler::ImmediateResponse::new(http::StatusCode::BAD_GATEWAY),
+                ))
+            } else {
+                Ok(HandlerAction::Continue(ResponseContinue {
+                    status_override: Some(http::StatusCode::CREATED),
+                    ..Default::default()
+                }))
+            }
+        }
+    }
+    for immediate in [false, true] {
+        for has_body in [false, true] {
+            let (spans, _guard) = capture_spans();
+            let (input, mut output) =
+                start(Arc::new(StatusHandler(immediate)), ExtProcConfig::default()).await;
+            input
+                .send(Ok(headers(Direction::Request, true)))
+                .await
+                .unwrap();
+            reply(&mut output).await.unwrap();
+            input
+                .send(Ok(headers(Direction::Response, !has_body)))
+                .await
+                .unwrap();
+            reply(&mut output).await.unwrap();
+            if has_body {
+                input
+                    .send(Ok(body(Direction::Response, b"body", true)))
+                    .await
+                    .unwrap();
+                reply(&mut output).await.unwrap();
+            }
+            drop((input, output));
+            let spans = spans.sorted();
+            let span = spans.iter().find(|s| s.name == "ext_proc").unwrap();
+            assert_eq!(
+                span.fields["http.response.status_code"],
+                if immediate { "502" } else { "201" }
+            );
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Handler for FailingHandler {
+    async fn handle_request(
+        &self,
+        _req: &http::Request<LazyBody>,
+        _context: &mut http::Extensions,
+    ) -> anyhow::Result<HandlerAction<RequestContinue>> {
+        anyhow::bail!("failed")
+    }
+}
+
+impl SpanLog {
+    fn sorted(&self) -> Vec<SpanRecord> {
+        let mut spans = self.0.lock().unwrap().clone();
+        spans.sort_by_key(|span| span.name);
+        spans
+    }
+}
+
+impl<S: Subscriber + for<'a> LookupSpan<'a>> Layer<S> for SpanLog {
+    fn on_new_span(&self, attrs: &Attributes<'_>, id: &Id, ctx: Context<'_, S>) {
+        let span = ctx.span(id).unwrap();
+        let mut record = SpanRecord {
+            name: span.name(),
+            parent: span.parent().map(|parent| parent.name()),
+            fields: BTreeMap::new(),
+        };
+        attrs.record(&mut FieldVisitor(&mut record.fields));
+        span.extensions_mut().insert(record);
+    }
+
+    fn on_record(&self, id: &Id, values: &Record<'_>, ctx: Context<'_, S>) {
+        let span = ctx.span(id).unwrap();
+        if let Some(record) = span.extensions_mut().get_mut::<SpanRecord>() {
+            values.record(&mut FieldVisitor(&mut record.fields));
+        }
+    }
+
+    fn on_close(&self, id: Id, ctx: Context<'_, S>) {
+        let span = ctx.span(&id).unwrap();
+        let record = span.extensions_mut().remove::<SpanRecord>();
+        self.0.lock().unwrap().extend(record);
+    }
+}
+
+impl Visit for FieldVisitor<'_> {
+    fn record_str(&mut self, field: &Field, value: &str) {
+        self.0.insert(field.name().to_string(), value.to_string());
+    }
+
+    fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
+        self.0
+            .insert(field.name().to_string(), format!("{value:?}"));
+    }
+}
+
+/// Spans closed while the guard lives; tests run on one thread, so the default subscriber covers them.
+fn capture_spans() -> (SpanLog, tracing::subscriber::DefaultGuard) {
+    let spans = SpanLog::default();
+    let guard = test_subscriber(Registry::default().with(spans.clone()));
+    (spans, guard)
+}
+
+fn test_subscriber(
+    subscriber: impl Subscriber + Send + Sync + 'static,
+) -> tracing::subscriber::DefaultGuard {
+    // Keep two dispatchers registered so uncaptured threads cannot disable shared callsites.
+    static BASELINE: std::sync::LazyLock<tracing::Dispatch> =
+        std::sync::LazyLock::new(|| tracing::Dispatch::new(Registry::default()));
+    std::sync::LazyLock::force(&BASELINE);
+    tracing::subscriber::set_default(subscriber)
 }
